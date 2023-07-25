@@ -11,7 +11,7 @@ from flask_login import (
 )
 from flask_mail import Message
 from flask_sqlalchemy import SQLAlchemy
-from sqlalchemy import or_, Integer, text
+from sqlalchemy import or_, and_, Integer, text
 from sqlalchemy.dialects.postgresql import ARRAY
 
 from SIMS_Portal import db, bcrypt
@@ -31,6 +31,7 @@ from SIMS_Portal.users.utils import (
 	update_member_locations
 )
 from SIMS_Portal.portfolios.utils import get_full_portfolio
+from SIMS_Portal.users.utils import download_profile_photo
 
 users = Blueprint('users', __name__)
 
@@ -41,6 +42,14 @@ def members():
 	members_query = db.session.query(User).filter(User.status == 'Active').order_by(User.id)
 	members = members_query.paginate(page = page, per_page = per_page)
 	return render_template('members.html', members=members)
+
+@users.route('/members/inactive')
+def inactive_members():
+	page = request.args.get('page', 1, type = int)
+	per_page = 24
+	members_query = db.session.query(User).filter(User.status == 'Inactive').order_by(User.id)
+	members = members_query.paginate(page = page, per_page = per_page)
+	return render_template('members_inactive.html', members=members)
 
 @users.route('/members/all') 
 @login_required
@@ -58,7 +67,7 @@ def members_all():
 		LEFT JOIN profile p ON p.id = up.profile_id
 		LEFT JOIN user_skill us ON us.user_id = u.id
 		LEFT JOIN skill s ON s.id = us.skill_id
-		WHERE u.status = 'Active'
+		WHERE u.status = 'Active' OR u.status = 'Inactive'
 		GROUP BY u.id, ns.ns_name
 		ORDER BY u.firstname
 	""")
@@ -208,14 +217,30 @@ def view_profile(id):
 @login_required
 def assign_profiles(user_id, profile_id, tier):
 	if current_user.is_admin == 1:
-		new_profile = user_profile.insert().values(user_id=user_id, profile_id=profile_id, tier=tier)
-		db.session.execute(new_profile)
-		db.session.commit()
-		current_app.logger.info('A new profile has been assigned to User-{}'.format(user_id))
-		flash('User has been assigned a new profile.', 'success')
-		return redirect(url_for('main.admin_landing'))
+		try:
+			# delete user's existing profiles at other tiers
+			user_profile_table = db.Table('user_profile', db.metadata, autoload=True, autoload_with=db.engine)
+			delete_condition = db.and_(
+				user_profile_table.c.user_id == user_id,
+				user_profile_table.c.profile_id == profile_id,
+				user_profile_table.c.tier != tier
+			)
+			db.session.execute(user_profile_table.delete().where(delete_condition))
+			db.session.commit()
+		
+			# insert the new profile for the user
+			new_profile = user_profile_table.insert().values(user_id=user_id, profile_id=profile_id, tier=tier)
+			db.session.execute(new_profile)
+			db.session.commit()
+		
+			current_app.logger.info('A new profile has been assigned to User-{}'.format(user_id))
+			flash('User has been assigned a new profile.', 'success')
+			return redirect(url_for('main.admin_landing'))
+		except Exception as e:
+			current_app.logger.error('Error assigning a new profile tier to user: {}'.format(e))
+			return redirect(url_for('main.admin_landing'))
 	else:
-		list_of_admins = db.session.query(User).filter(User.is_admin==1).all()
+		list_of_admins = db.session.query(User).filter(User.is_admin==True).all()
 		return render_template('errors/403.html', list_of_admins=list_of_admins), 403
 
 @users.route('/badges_more/<int:user_id>')
@@ -360,7 +385,7 @@ def update_specified_profile(id):
 		profile_picture = '/uploads/' + this_user.image_file
 		return render_template('profile_edit.html', title='Profile', profile_picture=profile_picture, form=form, ns_association=ns_association, current_user=this_user)
 	else:
-		list_of_admins = db.session.query(User).filter(User.is_admin==1).all()
+		list_of_admins = db.session.query(User).filter(User.is_admin==True).all()
 		return render_template('errors/403.html', list_of_admins=list_of_admins), 403
 
 @users.route('/delete_skill/<int:user_id>/<int:skill_id>', methods=['GET', 'POST'])
@@ -372,7 +397,7 @@ def delete_skill(user_id, skill_id):
 		flash('Successfully removed skill.', 'success')
 		return redirect(url_for('users.update_profile'))
 	else:
-		list_of_admins = db.session.query(User).filter(User.is_admin==1).all()
+		list_of_admins = db.session.query(User).filter(User.is_admin==True).all()
 		return render_template('errors/403.html', list_of_admins=list_of_admins), 403
 
 @users.route('/save_work_location/<int:user_id>', methods=['GET', 'POST'])
@@ -490,7 +515,7 @@ def approve_user(id):
 		flash("User needs to have a Slack ID updated on their profile.","danger")
 		return redirect(url_for('main.admin_landing'))
 	else:
-		list_of_admins = db.session.query(User).filter(User.is_admin==1).all()
+		list_of_admins = db.session.query(User).filter(User.is_admin==True).all()
 		return render_template('errors/403.html', list_of_admins=list_of_admins), 403
 
 @users.route('/user/delete/<int:id>', methods=['GET', 'POST'])
@@ -513,5 +538,22 @@ def delete_user(id):
 			flash("Error deleting user. Check that the user ID exists.")
 		return redirect(url_for('main.admin_landing'))
 	else:
-		list_of_admins = db.session.query(User).filter(User.is_admin==1).all()
+		list_of_admins = db.session.query(User).filter(User.is_admin==True).all()
+		return render_template('errors/403.html', list_of_admins=list_of_admins), 403
+
+@users.route('/user/save_slack_photo/<int:user_id>')
+@login_required
+def save_slack_photo_to_profile(user_id):
+	if current_user.id == user_id or current_user.is_admin == 1:
+		try:
+			user_info = db.session.query(User).filter(User.id == user_id).first()
+			download_profile_photo(user_info.slack_id)
+			flash('Your profile has been updated with your Slack photo!', 'success')
+			return redirect(url_for("users.profile"))
+		except Exception as e:
+			current_app.logger.error("User {} tried to save download their Slack photo and failed: {}".format(user_info.id, e))
+			flash('There was an error trying to download your photo. Please try again later or contact an administrator.', 'danger')
+			return redirect(url_for("users.profile"))
+	else:
+		list_of_admins = db.session.query(User).filter(User.is_admin==True).all()
 		return render_template('errors/403.html', list_of_admins=list_of_admins), 403
